@@ -83,17 +83,6 @@ open class ESTabBar: UITabBar {
 
     internal weak var customDelegate: ESTabBarDelegate?
     
-    /// set value > 0 to change tabbar height
-    /// 设置 > 0 的值了来修改TabBar的高度
-    public var tabBarHeight: CGFloat?{
-        didSet{
-            guard tabBarHeight ?? 0 > 0 else{
-                return
-            }
-            setNeedsLayout()
-        }
-    }
-    
     /// tabBar中items布局偏移量
     public var itemEdgeInsets = UIEdgeInsets.zero
     /// 是否设置为自定义布局方式，默认为空。如果为空，则通过itemPositioning属性来设置。如果不为空则忽略itemPositioning,所以当tabBar的itemCustomPositioning属性不为空时，如果想改变布局规则，请设置此属性而非itemPositioning。
@@ -157,14 +146,6 @@ open class ESTabBar: UITabBar {
         self.updateLayout()
     }
     
-    open override func sizeThatFits(_ size: CGSize) -> CGSize {
-        let defaultSize = super.sizeThatFits(size)
-        if let tabBarHeight, tabBarHeight > 0{
-            return CGSize(width: defaultSize.width, height: tabBarHeight)
-        }
-        return defaultSize
-    }
-    
     open override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
         var b = super.point(inside: point, with: event)
         if !b {
@@ -187,18 +168,33 @@ internal extension ESTabBar /* Layout */ {
             return
         }
         
-        let tabBarButtons = subviews.filter { subview -> Bool in
-            if let cls = NSClassFromString("UITabBarButton") {
-                return subview.isKind(of: cls)
+        // [KiwiGo patch] Bản gốc lấy UITabBarButton từ `subviews` rồi truy cập `tabBarButtons[idx]` không kiểm tra
+        // ⇒ crash (index out of range) khi không tìm đủ nút. Trên iOS 27 (đã kiểm tra Simulator 27.2) tab bar dùng
+        // kiểu nổi: nút là `_UITabButton` nằm trong `_UITabBarItemPlatterView`, không còn UITabBarButton nào.
+        // ⇒ tìm theo cây view, kiểm tra chỉ số; nếu thiếu nút hệ thống thì tự chia đều container (xem bên dưới).
+        let buttonClass: AnyClass? = NSClassFromString("UITabBarButton")
+        func findButtons(in view: UIView) -> [UIView] {
+            guard let cls = buttonClass else { return [] }
+            var result = [UIView]()
+            for subview in view.subviews where !(subview is ESTabBarItemContainer) {
+                if subview.isKind(of: cls) {
+                    result.append(subview)
+                } else {
+                    result.append(contentsOf: findButtons(in: subview))
+                }
             }
-            return false
-            } .sorted { (subview1, subview2) -> Bool in
-                return subview1.frame.origin.x < subview2.frame.origin.x
+            return result
+        }
+        let tabBarButtons = findButtons(in: self).sorted { (subview1, subview2) -> Bool in
+            return subview1.convert(subview1.bounds, to: self).minX < subview2.convert(subview2.bounds, to: self).minX
+        }
+        func button(_ idx: Int) -> UIView? {
+            return idx < tabBarButtons.count ? tabBarButtons[idx] : nil
         }
         
         if isCustomizing {
             for (idx, _) in tabBarItems.enumerated() {
-                tabBarButtons[idx].isHidden = false
+                button(idx)?.isHidden = false
                 moreContentView?.isHidden = true
             }
             for (_, container) in containers.enumerated(){
@@ -207,12 +203,12 @@ internal extension ESTabBar /* Layout */ {
         } else {
             for (idx, item) in tabBarItems.enumerated() {
                 if let _ = item as? ESTabBarItem {
-                    tabBarButtons[idx].isHidden = true
+                    button(idx)?.isHidden = true
                 } else {
-                    tabBarButtons[idx].isHidden = false
+                    button(idx)?.isHidden = false
                 }
                 if isMoreItem(idx), let _ = moreContentView {
-                    tabBarButtons[idx].isHidden = true
+                    button(idx)?.isHidden = true
                 }
             }
             for (_, container) in containers.enumerated(){
@@ -230,11 +226,27 @@ internal extension ESTabBar /* Layout */ {
             }
         }
         
-        if layoutBaseSystem {
+        // [KiwiGo patch] Không tìm đủ nút hệ thống (tab bar kiểu nổi của iOS 27) ⇒ ẩn khung kính của hệ thống
+        // (`_UITabBarItemPlatterView`, đè lên container) và chia đều container theo bề ngang, phía trên vùng an toàn.
+        let isFloatingSystemBar = !isCustomizing && tabBarButtons.count < containers.count
+        for subview in subviews where !(subview is ESTabBarItemContainer)
+            && NSStringFromClass(type(of: subview)).contains("Platter") {
+            subview.isHidden = isFloatingSystemBar
+        }
+        // Gesture của tab bar nổi nhận cú chạm trước container ⇒ hệ thống tự chuyển tab mà không gọi
+        // `select(itemAtIndex:)` (không đổi trạng thái chọn, không chạy hijack). Tắt nó để container xử lý như cũ.
+        gestureRecognizers?.forEach { $0.isEnabled = !isFloatingSystemBar }
+        if isFloatingSystemBar && layoutBaseSystem && !containers.isEmpty {
+            let height = bounds.height - safeAreaInsets.bottom
+            let eachWidth = bounds.width / CGFloat(containers.count)
+            for (idx, container) in containers.enumerated() {
+                container.frame = CGRect(x: CGFloat(idx) * eachWidth, y: 0, width: eachWidth, height: height)
+            }
+        } else if layoutBaseSystem {
             // System itemPositioning
             for (idx, container) in containers.enumerated(){
-                if !tabBarButtons[idx].frame.isEmpty {
-                    container.frame = tabBarButtons[idx].frame
+                if let button = button(idx), !button.frame.isEmpty {
+                    container.frame = button.convert(button.bounds, to: self)
                 }
             }
         } else {
@@ -348,7 +360,12 @@ internal extension ESTabBar /* Actions */ {
     
     @objc func select(itemAtIndex idx: Int, animated: Bool) {
         let newIndex = max(0, idx)
-        let currentIndex = (selectedItem != nil) ? (items?.firstIndex(of: selectedItem!) ?? -1) : -1
+        var currentIndex = (selectedItem != nil) ? (items?.firstIndex(of: selectedItem!) ?? -1) : -1
+        // [KiwiGo patch] Tab bar kiểu nổi của iOS 27 không cập nhật `selectedItem` ⇒ currentIndex = -1, tab cũ
+        // không được bỏ chọn (2 tab cùng sáng). Khi đó lấy tab đang sáng từ trạng thái của contentView.
+        if currentIndex == -1, let index = items?.firstIndex(where: { ($0 as? ESTabBarItem)?.contentView.selected == true }) {
+            currentIndex = index
+        }
         guard newIndex < items?.count ?? 0, let item = self.items?[newIndex], item.isEnabled == true else {
             return
         }
